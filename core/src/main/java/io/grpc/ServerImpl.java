@@ -34,6 +34,10 @@ package io.grpc;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Throwables;
 
+import io.grpc.HandlerRegistry.Method;
+import io.grpc.Metadata.Headers;
+import io.grpc.Metadata.Trailers;
+import io.grpc.transport.HttpUtil;
 import io.grpc.transport.ServerListener;
 import io.grpc.transport.ServerStream;
 import io.grpc.transport.ServerStreamListener;
@@ -180,6 +184,16 @@ public class ServerImpl implements Server {
    */
   public synchronized boolean isTerminated() {
     return terminated;
+  }
+
+  /**
+   * Returns a channel that can be used to dispatch requests directly into the server, without
+   * going through a transport (e.g. no socket, purely in-memory).
+   * 
+   * @return a channel for sending in-process requests to the server
+   */
+  public Channel getInProcessChannel() {
+     return new InProcessChannel(registry, executor);
   }
 
   /**
@@ -501,6 +515,187 @@ public class ServerImpl implements Server {
           return;
         }
         listener.onReady();
+      }
+    }
+  }
+  
+  // TODO(jh@squareup.com): Call this "unsafe" channel and also provide less performant one that
+  // uses marshalling (plus content encoding checks?) to ensure request & response types are right?
+  // Or perhaps we could add type tokens to the MethodDescriptor and ServerMethodDefinition objects
+  // so we can verify type-compatibility at runtime without resorting to serialization.
+  private static class InProcessChannel implements Channel {
+    private final HandlerRegistry registry;
+    private final Executor executor;
+     
+    InProcessChannel(HandlerRegistry registry, Executor executor) {
+      this.registry = registry;
+      this.executor = executor;
+    }
+
+    @Override
+    public <RequestT, ResponseT> Call<RequestT, ResponseT> newCall(
+        MethodDescriptor<RequestT, ResponseT> methodDescriptor) {
+      return new InProcessCall<RequestT, ResponseT>(methodDescriptor.getName(),
+          new SerializingExecutor(executor));
+    }
+  
+    private class InProcessCall<RequestT, ResponseT> extends Call<RequestT, ResponseT> {
+      private final String methodName;
+      private final Executor callExecutor;
+      private ServerCall.Listener<RequestT> listener;
+      private boolean started;
+      private boolean halfClosed;
+      private boolean cancelled;
+    
+      InProcessCall(String methodName, Executor callExecutor) {
+         this.methodName = methodName;
+         this.callExecutor = callExecutor;
+      }
+
+      @Override
+      public synchronized void start(final Call.Listener<ResponseT> responseListener,
+            Headers headers) {
+        Preconditions.checkState(!started, "Already started");
+        started = true;
+        Method method = registry.lookupMethod(methodName);
+        if (method == null) {
+          callExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+              responseListener.onClose(HttpUtil.httpStatusToGrpcStatus(404),
+                  new Metadata.Trailers());
+            }
+          });
+          // leave listener null
+          return;
+        }
+      
+        // Without reifiable type info for request and response types (like class tokens or the
+        // like), this isn't perfectly safe. A method descriptor with the same name but wrong types
+        // could lead to ClassCastExceptions.
+        // TODO(jh@squareup.com): could possibly improve type-safety by marshalling to bytes and
+        // back, but that is much less efficient and could still be problematic if the Marshaller
+        // instances for the MethodDescriptor use a different serialization format than those
+        // registered with the ServerMethodDefinition.
+        @SuppressWarnings("unchecked")
+        ServerCallHandler<RequestT, ResponseT> handler =
+            (ServerCallHandler<RequestT, ResponseT>) method.getMethodDefinition()
+                .getServerCallHandler();
+        this.listener = handler.startCall(methodName,
+            new InProcessServerCall<ResponseT>(responseListener, this), headers);
+      }
+
+      @Override
+      public void request(int numMessages) {
+      }
+
+      @Override
+      public synchronized void cancel() {
+        Preconditions.checkState(started, "Not started");
+        if (listener == null) {
+           return;
+        }
+        callExecutor.execute(new Runnable() {
+          @Override
+          public void run() {
+            synchronized (InProcessCall.this) {
+              if (!cancelled) {
+                cancelled = true;
+              } else {
+                return;
+              }
+            }
+            listener.onCancel();
+          }
+        });
+      }
+      
+      synchronized boolean isCancelled() {
+        return cancelled;
+      }
+
+      @Override
+      public synchronized void halfClose() {
+        Preconditions.checkState(started, "Not started");
+        if (listener == null) {
+          return;
+        }
+        callExecutor.execute(new Runnable() {
+          @Override
+          public void run() {
+            synchronized (InProcessCall.this) {
+              if (!halfClosed) {
+                halfClosed = true;
+              } else {
+                return;
+              }
+            }
+            listener.onHalfClose();
+          }
+        });
+      }
+
+      @Override
+      public synchronized void sendPayload(final RequestT payload) {
+        Preconditions.checkState(started, "Not started");
+        if (listener == null) {
+          return;
+        }
+        callExecutor.execute(new Runnable() {
+          @Override
+          public void run() {
+            synchronized (InProcessCall.this) {
+              if (halfClosed || cancelled) {
+                return;
+              }
+            }
+            listener.onPayload(payload);
+          }
+        });
+      }
+
+      @Override
+      public boolean isReady() {
+        return true;
+      }
+    }
+    
+    private class InProcessServerCall<ResponseT> extends ServerCall<ResponseT> {
+      private final Call.Listener<ResponseT> listener;
+      private final InProcessCall<?, ?> call;
+      
+      InProcessServerCall(Call.Listener<ResponseT> listener, InProcessCall<?, ?> call) {
+         this.listener = listener;
+         this.call = call;
+      }
+       
+      @Override
+      public void request(int numMessages) {
+      }
+
+      @Override
+      public void sendHeaders(Headers headers) {
+        listener.onHeaders(headers);
+      }
+
+      @Override
+      public void sendPayload(ResponseT payload) {
+        listener.onPayload(payload);
+      }
+
+      @Override
+      public boolean isReady() {
+        return true;
+      }
+
+      @Override
+      public void close(Status status, Trailers trailers) {
+        listener.onClose(status, trailers);
+      }
+
+      @Override
+      public boolean isCancelled() {
+        return call.isCancelled();
       }
     }
   }

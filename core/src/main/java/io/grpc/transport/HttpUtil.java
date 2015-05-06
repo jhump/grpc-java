@@ -72,6 +72,12 @@ public final class HttpUtil {
    * Maps HTTP error response status codes to transport codes.
    */
   public static Status httpStatusToGrpcStatus(int httpStatusCode) {
+    return httpStatusToBasicGrpcStatus(httpStatusCode)
+          .augmentDescription("HTTP/2 status code: " + httpStatusCode);
+  }
+  
+  /** Maps HTTP status to GRPC status. */
+  private static Status httpStatusToBasicGrpcStatus(int httpStatusCode) {
     // Specific HTTP code handling.
     switch (httpStatusCode) {
       case HttpURLConnection.HTTP_BAD_REQUEST:  // 400
