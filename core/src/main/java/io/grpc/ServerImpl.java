@@ -50,6 +50,9 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicMarkableReference;
+
+import javax.annotation.concurrent.GuardedBy;
 
 /**
  * Default implementation of {@link Server}, for creation by transports.
@@ -541,13 +544,16 @@ public class ServerImpl implements Server {
   
     private class InProcessCall<RequestT, ResponseT> extends Call<RequestT, ResponseT> {
       private final String methodName;
-      private final Executor callExecutor;
-      private ServerCall.Listener<RequestT> listener;
-      private boolean started;
-      private boolean halfClosed;
-      private boolean cancelled;
+      private final SerializingExecutor callExecutor;
+      
+      @GuardedBy("this") private ServerCall.Listener<RequestT> listener;
+      @GuardedBy("this") private boolean started;
+      
+      @GuardedBy("callExecutor") private boolean halfClosed;
+      
+      private volatile boolean cancelled;
     
-      InProcessCall(String methodName, Executor callExecutor) {
+      InProcessCall(String methodName, SerializingExecutor callExecutor) {
          this.methodName = methodName;
          this.callExecutor = callExecutor;
       }
@@ -588,68 +594,67 @@ public class ServerImpl implements Server {
       @Override
       public void request(int numMessages) {
       }
+      
+      private synchronized ServerCall.Listener<RequestT> getListener() {
+         Preconditions.checkState(started, "Not started");
+         return listener;
+      }
 
       @Override
-      public synchronized void cancel() {
-        Preconditions.checkState(started, "Not started");
-        if (listener == null) {
-           return;
+      public void cancel() {
+        final ServerCall.Listener<RequestT> l = getListener();
+        if (l == null) {
+          return;
         }
         callExecutor.execute(new Runnable() {
           @Override
           public void run() {
-            synchronized (InProcessCall.this) {
-              if (!cancelled) {
-                cancelled = true;
-              } else {
-                return;
-              }
+            if (!cancelled) {
+              cancelled = true;
+            } else {
+              return;
             }
-            listener.onCancel();
+            l.onCancel();
           }
         });
       }
       
-      synchronized boolean isCancelled() {
+      boolean isCancelled() {
         return cancelled;
       }
 
       @Override
-      public synchronized void halfClose() {
-        Preconditions.checkState(started, "Not started");
-        if (listener == null) {
+      public void halfClose() {
+        final ServerCall.Listener<RequestT> l = getListener();
+        if (l == null) {
           return;
         }
         callExecutor.execute(new Runnable() {
           @Override
           public void run() {
-            synchronized (InProcessCall.this) {
-              if (!halfClosed) {
-                halfClosed = true;
-              } else {
-                return;
-              }
+            if (!halfClosed) {
+              halfClosed = true;
+            } else {
+              return;
             }
-            listener.onHalfClose();
+            l.onHalfClose();
           }
         });
       }
 
       @Override
-      public synchronized void sendPayload(final RequestT payload) {
-        Preconditions.checkState(started, "Not started");
-        if (listener == null) {
-          return;
-        }
+      public void sendPayload(final RequestT payload) {
+         final ServerCall.Listener<RequestT> l = getListener();
+         if (l == null) {
+           return;
+         }
         callExecutor.execute(new Runnable() {
           @Override
           public void run() {
-            synchronized (InProcessCall.this) {
-              if (halfClosed || cancelled) {
-                return;
-              }
+            if (halfClosed || cancelled) {
+              return;
             }
-            listener.onPayload(payload);
+            l.onPayload(payload);
           }
         });
       }
