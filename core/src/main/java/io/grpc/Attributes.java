@@ -31,6 +31,7 @@
 
 package io.grpc;
 
+import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 
 import java.util.Collections;
@@ -106,6 +107,19 @@ public final class Attributes {
   @Override
   public String toString() {
     return data.toString();
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    Attributes that = (Attributes) o;
+    return Objects.equal(data, that.data);
+  }
+
+  @Override
+  public int hashCode() {
+    return data.hashCode();
   }
 
   public static final class Builder {

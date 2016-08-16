@@ -31,6 +31,8 @@
 
 package io.grpc;
 
+import com.google.common.base.Objects;
+
 import java.net.SocketAddress;
 
 import javax.annotation.concurrent.Immutable;
@@ -72,5 +74,19 @@ public final class ResolvedServerInfo {
   @Override
   public String toString() {
     return "[address=" + address + ", attrs=" + attributes + "]";
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
+    ResolvedServerInfo that = (ResolvedServerInfo) o;
+    return Objects.equal(address, that.address) &&
+        Objects.equal(attributes, that.attributes);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hashCode(address, attributes);
   }
 }
